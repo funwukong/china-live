@@ -1,0 +1,11 @@
+__MACOSX/
+__pycache__/
+*.pyc
+*.pyo
+.git/
+.gitignore
+Dockerfile
+docker-compose.yml
+.dockerignore
+README.md
+artifacts/
