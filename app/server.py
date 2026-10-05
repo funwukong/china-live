@@ -1,17 +1,25 @@
 """Merged China live TV gateway.
 
-Serves the three bundled providers (央视频 / 央视官网 / 广东广电) as one
-M3U catalogue plus a proxy endpoint that resolves the live HLS manifest on
-demand.  Port defaults to 8577 and is overridable with the PORT env var.
+Serves the bundled providers as one M3U catalogue:
+
+* ``aptv`` (央视频, APTV spider) exposes its own local HLS relay.  Its manifest
+  references ``http://127.0.0.1:<port>``, so this gateway reverse-proxies the
+  relay and rewrites chunk URLs before handing the playlist to the player.
+* ``gdtv`` (广东广电) resolves the live manifest through ``/proxy?sp=gdtv``.
+
+Port defaults to 8577 and is overridable with the PORT env var.
 """
 
 import datetime
 import html
 import json
 import os
+import re
 import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import providers
@@ -20,6 +28,7 @@ HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8577"))
 BASE_URL = os.environ.get("BASE_URL", "")
 CATALOG_TTL = 600
+RELAY_TIMEOUT = 30
 
 _lock = threading.Lock()
 
@@ -37,10 +46,6 @@ def _base_url(handler):
         return BASE_URL.rstrip("/")
     host = handler.headers.get("Host") or "%s:%d" % (HOST, PORT)
     return "http://%s" % host
-
-
-def _origin(handler):
-    return _base_url(handler)
 
 
 def _rewrite(url, origin):
@@ -82,7 +87,7 @@ def _extinf(channel, group_name):
 
 
 def _m3u(handler, key=None):
-    origin = _origin(handler)
+    origin = _base_url(handler)
     groups, errors = _catalog(key)
     lines = ["#EXTM3U"]
     total = 0
@@ -161,7 +166,7 @@ def _diag():
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "china-live/1.0"
+    server_version = "china-live/1.2"
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):
@@ -198,7 +203,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/sources":
             payload = [
-                {"key": p.key, "name": p.title(), "url": p.url}
+                {"key": p.key, "name": p.title(), "kind": p.kind, "url": p.url}
                 for p in providers.PROVIDERS
             ]
             self._send(200, json.dumps(payload, ensure_ascii=False), "application/json; charset=utf-8")
@@ -211,6 +216,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/proxy":
             self._proxy(urllib.parse.parse_qs(parsed.query))
+            return
+        if path.startswith("/aptv/"):
+            self._aptv(path)
             return
 
         if path.endswith(".m3u") and len(path) > 4:
@@ -245,6 +253,58 @@ class Handler(BaseHTTPRequestHandler):
             return
         log("proxy %s %s -> %d (%.2fs)" % (key, params, code, time.time() - started))
         self._send(code, body, ctype, headers)
+
+    def _aptv(self, path):
+        """Reverse-proxy the APTV spider's on-box HLS relay.
+
+        The spider hands out ``http://127.0.0.1:<port>/...`` URLs, which only
+        resolve on the same host.  We fetch the playlist locally and rewrite its
+        chunk URLs to this gateway so remote players work.
+        """
+        provider = providers.PROVIDER_MAP.get("aptv")
+        if provider is None:
+            self._send(404, "aptv source not configured\n")
+            return
+        relative = path[len("/aptv"):]
+
+        playlist = re.fullmatch(r"/([\w]+)\.m3u8", relative)
+        chunk = re.fullmatch(r"/chunk/([\w]+)/(\d+)\.ts", relative)
+        if not playlist and not chunk:
+            self._send(404, "not found\n")
+            return
+
+        try:
+            port = provider.local_port()
+        except Exception as error:
+            self._send(502, "aptv relay unavailable: %s\n" % error)
+            return
+
+        target = "http://127.0.0.1:%d%s" % (port, relative)
+        try:
+            request = urllib.request.Request(target, headers={"User-Agent": "china-live"})
+            with urllib.request.urlopen(request, timeout=RELAY_TIMEOUT) as response:
+                code = response.status
+                ctype = response.headers.get("Content-Type", "application/octet-stream")
+                body = response.read()
+        except urllib.error.HTTPError as error:
+            self._send(error.code, "relay HTTP %d\n" % error.code)
+            return
+        except Exception as error:
+            self._send(502, "relay error: %s\n" % error)
+            return
+
+        if playlist:
+            text = body.decode("utf-8", "replace")
+            text = re.sub(
+                r"http://127\.0\.0\.1:%d/chunk/([\w]+)/(\d+)\.ts" % port,
+                lambda match: "%s/aptv/chunk/%s/%s.ts"
+                % (_base_url(self), match.group(1), match.group(2)),
+                text,
+            )
+            self._send(code, text, "application/vnd.apple.mpegurl")
+            return
+
+        self._send(code, body, ctype)
 
 
 def main():

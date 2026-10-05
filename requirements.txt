@@ -1,5 +1,3 @@
+# APTV (live/cctv.py) is pure standard library.
 requests==2.32.3
 websocket-client==1.8.0
-lxml==5.3.0
-pycryptodome==3.21.0
-pywasm==0.4.7

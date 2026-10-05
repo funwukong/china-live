@@ -1,26 +1,27 @@
 # China Live
 
-聚合央视官网、央视频、广东广电三个直播源，以 Docker 方式对外提供统一的 M3U 订阅。服务监听 **8577** 端口。
+聚合央视频（APTV 源）与广东广电两个直播源，以 Docker 方式对外提供统一的 M3U 订阅。服务监听 **8577** 端口。
 
 ## 包含的源
 
-- 央视频（`ysp`，`live/yangshipin.py`）：央视频道 + 卫视频道，约 56 路
-- 央视官网（`cctv`，`live/cctv.py`）：CCTV-1 ~ CCTV-17 及海外版，约 20 路
+- 央视频（`aptv`，`live/cctv.py`，由 APTV 源码改造）：央视频道 + 卫视频道 + CGTN + 4K + 付费剧场，约 63 路
 - 广东广电（`gdtv`，`live/gdtv.py`）：广东本地频道，约 18 路
 
-各源的 spider 来自 `China/live/` 仓库，原样保留；`app/base/` 用标准库 + requests / websocket-client 实现了 TVBox 的 `base.spider` / `base.net` 接口，使这些 spider 可以在播放器之外独立运行。
+`live/cctv.py` 即 APTV.py 源码，自包含纯标准库，内置 JCE 时移 + bkliveinfo(cKey) 双协议与本地 HLS 分片中继（`127.0.0.1:19876`）。由于中继地址只在本机有效，`server.py` 会反向代理并把 playlist 里的分片地址改写成本服务的地址。`app/base/` 用标准库 + requests / websocket-client 实现了 TVBox 的 `base.spider` / `base.net` 接口，供广东广电源在播放器之外运行。
 
 ## 接口
 
 - `/`：首页，列出各源订阅链接
-- `/all.m3u`：聚合订阅，一次导入全部频道（约 94 路）
-- `/ysp.m3u`、`/cctv.m3u`、`/gdtv.m3u`：单源订阅
-- `/proxy?sp=<源>&...`：频道实际播放地址（302 跳转到 CDN 的 m3u8，EPG 接口返回 JSON）
+- `/all.m3u`：聚合订阅，一次导入全部频道（约 81 路）
+- `/aptv.m3u`、`/gdtv.m3u`：单源订阅
+- `/aptv/<频道>.m3u8`：央视频 HLS 清单（反向代理本地中继，已改写分片地址）
+- `/aptv/chunk/<频道>/<序号>.ts`：央视频视频分片
+- `/proxy?sp=gdtv&id=<频道>`：广东广电播放地址（302 跳转到 CDN 的 m3u8）
 - `/health`：健康探针，容器健康检查用
 - `/diag`：诊断，列出每个源的频道数与状态
 - `/sources`：JSON 列出已加载的源
 
-播放器直连各电视台 CDN 拉视频分片，本服务只下发 m3u8 清单，不跑视频流量。
+广东广电源只下发 m3u8 清单，播放器直连其 CDN；央视频源因中继在服务本机，分片会经本服务转发。
 
 ## 部署
 
@@ -58,6 +59,7 @@ PORT=8080 python app/server.py  # 自定义端口
 ## 说明
 
 - 端口与监听地址由 `PORT` / `HOST` 环境变量控制，容器内默认 `0.0.0.0:8577`。
-- 频道清单每 10 分钟刷新；播放地址按各 spider 自身的缓存策略刷新（`cctv`/`gdtv` 即时，`ysp` 60 秒）。
+- 频道清单每 10 分钟刷新；央视频分片由 APTV 后台线程每 2 秒刷新。
 - 部分频道（如 CCTV5）受地区版权限制可能返回空，这是上游限制，非服务问题。
-- 镜像基于 `python:3.12-slim`，依赖见 `requirements.txt`（requests、lxml、pycryptodome、websocket-client、pywasm==0.4.7）。
+- 镜像基于 `python:3.12-slim`；`live/cctv.py`（APTV）为纯标准库，仅广东广电源需要 `requests` / `websocket-client`。
+- 央视频源的中继端口从 19876 起在容器内自动选择，不对外暴露，只经 8577 反向代理。

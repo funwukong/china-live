@@ -56,7 +56,7 @@ def _perform(caller, url, options):
 
 
 class Session:
-    """Cookie carrying session used by the yangshipin player API."""
+    """Cookie carrying session that can set a cookie for a whole domain."""
 
     def __init__(self):
         self._session = requests.Session()
