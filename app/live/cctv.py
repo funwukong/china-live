@@ -3,11 +3,11 @@
 """
 ysp-live 央视频直播 (浮生影院 Spider 版)
 
-修复 TVBox ExoPlayer 不刷新 HLS playlist 的问题:
-    - playlist 窗口缩小到 5 片 (~25 秒), 迫使播放器频繁回拉
-    - 去掉 PROGRAM-DATE-TIME 避免播放器用 PDT 对时错位
-    - 分片 URL 指向本地 /chunk/<slug>/<seq>.ts, 由本地实时转发, 永不过期
-    - 后台每 2 秒刷新一次 JCE 时移接口
+优化自 waastudios/ysptp-docker: 播放器直连央视 CDN 拉分片, 本机只下发清单,
+不跑视频流量 (直接淘汰本地 /chunk 中继, 省带宽且更易稳定):
+    - JCE 时移转直播返回 m3u8, 直接返回给播放器 (直连 CDN)
+    - bkliveinfo(cKey) 备用协议, 其 playurl 缓存 600 秒, 不必每轮重签名
+    - 去 PROGRAM-DATE-TIME, 采用 LIVE 滑动窗口, 避免 ExoPlayer 对时错位
 
 协议: JCE PidTimeShift + bkliveinfo(cKey) 自动切换
 仅标准库。
@@ -309,6 +309,33 @@ def bk_playurls(channel_id, live_pid, defn='fhd'):
     return urls
 
 
+def fetch_abs_playlist(url, depth=0):
+    """Follow master + variant m3u8 and return an absolute-segment playlist."""
+    req = urllib.request.Request(url, headers={
+        'User-Agent': UA, 'Referer': 'https://live.cctv.cn/',
+        'Accept': 'application/vnd.apple.mpegurl,application/json,*/*'})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        text = r.read().decode('utf-8', 'replace')
+        final = r.geturl()
+    if depth < 2:
+        lines = text.splitlines()
+        for i, ln in enumerate(lines):
+            if ln.strip().startswith('#EXT-X-STREAM-INF'):
+                for j in range(i + 1, len(lines)):
+                    s = lines[j].strip()
+                    if s and not s.startswith('#'):
+                        return fetch_abs_playlist(urllib.parse.urljoin(final, s), depth + 1)
+                break
+    out = []
+    for ln in text.splitlines():
+        s = ln.strip()
+        if s and not s.startswith('#'):
+            out.append(urllib.parse.urljoin(final, s))
+        else:
+            out.append(ln)
+    return '\n'.join(out)
+
+
 # ================================================================ 频道表
 
 CHANNELS = [
@@ -380,12 +407,11 @@ CHANNELS = [
 UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36'
 
 WINDOW = 300
-REFRESH_INTERVAL = 2              # 后台刷新间隔, 越短越不容易断
-IDLE_TIMEOUT = 300
-MAX_SEGS = 400
-PLAYLIST_WINDOW = 10              # playlist 返回最近 10 片 (~60 秒), 本地转发永不过期, 缓冲更深不易断
-LOCAL_PORT_PREFERRED = 19876
-LOCAL_PORT_RANGE = 50
+REFRESH_INTERVAL = 15            # 后台刷新间隔 (bkliveinfo 地址缓存 600s, 不必更频繁)
+IDLE_TIMEOUT = 120               # 无人观看后停止刷新, 释放 CDN 连接
+MAX_SEGS = 60                    # 内存里保留的分片序号, 仅用于 JCE 直连模式
+BK_URL_TTL = 600                 # bkliveinfo playurl 缓存时间, 到期才重新签名
+PLAYER_WINDOW = 30              # 直连 m3u8 返回最近 N 片 (~3 分钟回看)
 
 CHANNEL_MAP = {c[0]: {'slug': c[0], 'name': c[1], 'sid': c[2], 'pid': c[3], 'defn': c[4]} for c in CHANNELS}
 
@@ -486,13 +512,13 @@ class _ChannelState:
         self.pid = pid
         self.defn = defn
         self.lock = threading.Lock()
-        self.segments = {}          # key -> [seq, dur, pdt, url]
-        self.order = deque()
-        self.seq = 0
         self.last_access = 0.0
         self.thread = None
         self.last_error = ''
         self.mode = 'bk' if slug in FORCE_BK else 'jce'
+        self.bk_urls = []            # 缓存的 bkliveinfo playurl
+        self.bk_urls_time = 0.0
+        self.bk_playlist = ''       # 直连 m3u8 (绝对地址)
         self._starting = False
 
 
@@ -514,7 +540,12 @@ def _seg_key(url, pdt):
 
 
 def _append_segments(ch, segs):
+    """JCE direct mode: track a rolling segment window in memory."""
     with ch.lock:
+        if not hasattr(ch, 'segments'):
+            ch.segments = {}
+            ch.order = deque()
+            ch.seq = 0
         for dur, pdt, url in segs:
             key = _seg_key(url, pdt)
             if key in ch.segments:
@@ -526,6 +557,29 @@ def _append_segments(ch, segs):
         while len(ch.order) > MAX_SEGS:
             ch.segments.pop(ch.order.popleft(), None)
         ch.last_error = ''
+
+
+def build_playlist(ch):
+    """Return a direct-CDN m3u8 for the player, or None if empty."""
+    with ch.lock:
+        if ch.mode == 'bk':
+            return ch.bk_playlist or None
+        segs = [ch.segments[k] for k in list(ch.order) if k in ch.segments]
+    if not segs:
+        return None
+    window = segs[-PLAYER_WINDOW:]
+    target = max(6, max(int(s[1] + 0.5) for s in window))
+    out = [
+        '#EXTM3U',
+        '#EXT-X-VERSION:3',
+        '#EXT-X-TARGETDURATION:%d' % target,
+        '#EXT-X-MEDIA-SEQUENCE:%d' % window[0][0],
+        '#EXT-X-DISCONTINUITY-SEQUENCE:0',
+    ]
+    for _seq, dur, _pdt, url in window:
+        out.append('#EXTINF:%.3f,' % dur)
+        out.append(url)
+    return '\n'.join(out) + '\n'
 
 
 def _parse_m3u8(text, base_url):
@@ -559,39 +613,39 @@ def _jce_refresh(ch):
 
 
 def _bk_refresh(ch):
-    urls = bk_playurls(ch.sid, ch.pid, ch.defn)
+    now = time.time()
+    # 复用缓存的 playurl; 仅在过期或首次时重新签名 bkliveinfo
+    if now - ch.bk_urls_time > BK_URL_TTL or not ch.bk_urls:
+        ch.bk_urls = bk_playurls(ch.sid, ch.pid, ch.defn)
+        ch.bk_urls_time = now
+        _log('%s bkliveinfo 取到 %d 个地址' % (ch.slug, len(ch.bk_urls)))
     last_err = ''
-    for u in urls:
-        try:
-            req = urllib.request.Request(u, headers={
-                'User-Agent': UA,
-                'Referer': 'https://live.cctv.cn/',
-                'Accept': 'application/vnd.apple.mpegurl,application/json,*/*',
-            })
-            with urllib.request.urlopen(req, timeout=20) as r:
-                text = r.read().decode('utf-8', 'replace')
-                final = r.geturl()
-            lines = text.splitlines()
-            for i, ln in enumerate(lines):
-                if ln.strip().startswith('#EXT-X-STREAM-INF'):
-                    for j in range(i + 1, len(lines)):
-                        s = lines[j].strip()
-                        if s and not s.startswith('#'):
-                            sub = urllib.parse.urljoin(final, s)
-                            req2 = urllib.request.Request(sub, headers={'User-Agent': UA})
-                            with urllib.request.urlopen(req2, timeout=20) as r2:
-                                text = r2.read().decode('utf-8', 'replace')
-                                final = r2.geturl()
-                            break
-                    break
-            segs = _parse_m3u8(text, final)
-            if segs:
-                _append_segments(ch, segs)
+    for attempt in range(2):
+        for u in ch.bk_urls:
+            try:
+                pl = fetch_abs_playlist(u)
+                if '#EXTM3U' not in pl:
+                    continue
+                with ch.lock:
+                    ch.bk_playlist = pl
+                    ch.last_error = ''
                 return True
-        except Exception as e:
-            last_err = '%s: %s' % (type(e).__name__, e)
-            continue
-    raise RuntimeError(last_err or 'bk playlist failed')
+            except urllib.error.HTTPError as e:
+                last_err = 'HTTPError: HTTP %s' % e.code
+                if e.code == 403:
+                    time.sleep(2)
+                continue
+            except Exception as e:
+                last_err = '%s: %s' % (type(e).__name__, e)
+        if attempt == 0:
+            try:
+                ch.bk_urls = bk_playurls(ch.sid, ch.pid, ch.defn)
+                ch.bk_urls_time = time.time()
+                _log('%s 地址疑似过期, 已重取' % ch.slug)
+            except Exception:
+                pass
+    ch.bk_urls_time = 0
+    raise RuntimeError(last_err[:120] or 'bk playlist failed')
 
 
 def _refresh_once(ch):
@@ -603,6 +657,11 @@ def _refresh_once(ch):
         except DeadHostError:
             ch.mode = 'bk'
             _log('%s JCE 坏域名, 切换 bkliveinfo' % ch.slug)
+            return _bk_refresh(ch)
+        except Exception as e:
+            ch.last_error = ('%s: %s' % (type(e).__name__, e))[:120]
+            ch.mode = 'bk'
+            _log('%s JCE 失败, 回退 bkliveinfo: %s' % (ch.slug, ch.last_error))
             return _bk_refresh(ch)
     except Exception as e:
         ch.last_error = ('%s: %s' % (type(e).__name__, e))[:120]
@@ -622,7 +681,8 @@ def _ensure_channel(ch):
     with ch.lock:
         if ch._starting:
             return
-        need_fetch = not ch.segments
+        # BK 模式没有 segments 属性; 用 bk_playlist 判断是否需要首拉
+        need_fetch = (getattr(ch, 'segments', None) is None) or (not getattr(ch, 'bk_playlist', ''))
         need_thread = ch.thread is None or not ch.thread.is_alive()
         if need_fetch or need_thread:
             ch._starting = True
@@ -639,272 +699,6 @@ def _ensure_channel(ch):
             ch._starting = False
 
 
-# ================================================================ 本地 HTTP 服务
-
-_LOCAL_PORT = None
-_LOCAL_LOCK = threading.Lock()
-
-
-class _LocalHandler(BaseHTTPRequestHandler):
-    protocol_version = 'HTTP/1.1'
-    server_version = 'ysp-live-spider'
-
-    def log_message(self, fmt, *args):
-        pass
-
-    def _send(self, code, body, ctype='text/plain; charset=utf-8', extra=None):
-        data = body.encode('utf-8') if isinstance(body, str) else body
-        try:
-            self.send_response(code)
-            self.send_header('Content-Type', ctype)
-            self.send_header('Content-Length', str(len(data)))
-            self.send_header('Access-Control-Allow-Origin', '*')
-            self.send_header('Cache-Control', 'no-cache, no-store, must-revalidate')
-            self.send_header('Pragma', 'no-cache')
-            self.send_header('Expires', '0')
-            if extra:
-                for k, v in extra.items():
-                    self.send_header(k, v)
-            self.end_headers()
-            self.wfile.write(data)
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
-            pass
-
-    def do_HEAD(self):
-        # 有些播放器先用 HEAD 探测
-        path = urllib.parse.urlparse(self.path).path
-        m = re.match(r'^/([\w]+)\.m3u8$', path)
-        if m:
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/vnd.apple.mpegurl')
-            self.send_header('Cache-Control', 'no-cache, no-store')
-            self.end_headers()
-            return
-        self.send_response(404)
-        self.end_headers()
-
-    def do_GET(self):
-        path = urllib.parse.urlparse(self.path).path
-
-        if path == '/health':
-            self._send(200, 'ok')
-            return
-        if path == '/diag':
-            lines = []
-            for slug, ch in CHANNEL_STATE.items():
-                with ch.lock:
-                    n = len(ch.order)
-                lines.append('%s mode=%s segs=%d err=%s' % (slug, ch.mode, n, ch.last_error))
-            self._send(200, '\n'.join(lines) + '\n')
-            return
-
-        m = re.match(r'^/([\w]+)\.m3u8$', path)
-        if m:
-            self._serve_m3u8(m.group(1))
-            return
-
-        m = re.match(r'^/([\w]+)\.ts$', path)
-        if m:
-            self._serve_ts(m.group(1))
-            return
-
-        m = re.match(r'^/chunk/([\w]+)/(\d+)\.ts$', path)
-        if m:
-            self._serve_chunk(m.group(1), int(m.group(2)))
-            return
-
-        self._send(404, 'not found\n')
-
-    # ---------- HLS playlist ----------
-
-    def _serve_m3u8(self, slug):
-        ch = CHANNEL_STATE.get(slug)
-        if not ch:
-            self._send(404, 'unknown channel\n')
-            return
-        _ensure_channel(ch)
-
-        # 注意: 这里不能同步 _refresh_once。播放器每次拉 m3u8 都会触发一次
-        # 网络请求, 接口稍慢/抖动时 m3u8 响应会卡到播放器超时,
-        # 表现为"播放几分钟后断开"。后台线程每 REFRESH_INTERVAL 秒持续刷新,
-        # _ensure_channel 保证线程存活, 此处只读内存缓存, 毫秒级返回。
-        with ch.lock:
-            keys = list(ch.order)
-            segs = [ch.segments[k] for k in keys if k in ch.segments]
-            # 只返回最近一个窗口; 本地分片转发永不过期, 播放器随时可回拉
-            window = segs[-PLAYLIST_WINDOW:] if segs else []
-
-        if not window:
-            self._send(503, 'no data: %s\n' % (ch.last_error or 'fetching'))
-            return
-
-        ch.last_access = time.time()
-        port = _LOCAL_PORT
-        target = max(6, int(max(s[1] for s in window) + 0.5))
-
-        out = [
-            '#EXTM3U',
-            '#EXT-X-VERSION:3',
-            # 不写 #EXT-X-PLAYLIST-TYPE:EVENT: 声明 EVENT 却滑动窗口,
-            # 违反 HLS 语义, ExoPlayer 等播放器会判定流异常, 播放几分钟后停止。
-            # 无类型 = LIVE 滑动窗口, MEDIA-SEQUENCE 前进是标准行为。
-            '#EXT-X-TARGETDURATION:%d' % target,
-            '#EXT-X-MEDIA-SEQUENCE:%d' % window[0][0],
-            '#EXT-X-DISCONTINUITY-SEQUENCE:0',
-        ]
-        for seq, dur, _pdt, _url in window:
-            out.append('#EXTINF:%.3f,' % dur)
-            out.append('http://127.0.0.1:%d/chunk/%s/%d.ts' % (port, slug, seq))
-
-        self._send(200, '\n'.join(out) + '\n', 'application/vnd.apple.mpegurl')
-
-    # ---------- 分片转发 ----------
-
-    def _serve_chunk(self, slug, seq):
-        ch = CHANNEL_STATE.get(slug)
-        if not ch:
-            self._send(404, 'unknown\n')
-            return
-
-        ch.last_access = time.time()
-
-        with ch.lock:
-            url = None
-            for k in ch.order:
-                s = ch.segments.get(k)
-                if s and s[0] == seq:
-                    url = s[3]
-                    break
-
-        if not url:
-            self._send(404, 'chunk expired\n')
-            return
-
-        try:
-            req = urllib.request.Request(url, headers={
-                'User-Agent': UA,
-                'Referer': 'https://live.cctv.cn/',
-            })
-            with urllib.request.urlopen(req, timeout=15) as r:
-                body = r.read()
-            self._send(200, body, 'video/mp2t')
-        except urllib.error.HTTPError as e:
-            self._send(e.code, 'chunk HTTP %d\n' % e.code)
-        except Exception as e:
-            self._send(502, 'chunk error: %s\n' % e)
-
-    # ---------- TS 无限流中继 (备用) ----------
-
-    def _serve_ts(self, slug):
-        ch = CHANNEL_STATE.get(slug)
-        if not ch:
-            self._send(404, 'unknown\n')
-            return
-        _ensure_channel(ch)
-
-        for _ in range(60):
-            with ch.lock:
-                if ch.order:
-                    break
-            time.sleep(0.25)
-        else:
-            self._send(503, 'no data\n')
-            return
-
-        try:
-            self.send_response(200)
-            self.send_header('Content-Type', 'video/mp2t')
-            self.send_header('Transfer-Encoding', 'chunked')
-            self.send_header('Cache-Control', 'no-cache, no-store')
-            self.send_header('Access-Control-Allow-Origin', '*')
-            self.end_headers()
-        except (BrokenPipeError, ConnectionResetError):
-            return
-
-        try:
-            self.connection.settimeout(120)
-        except Exception:
-            pass
-
-        def _write_chunk(data):
-            if not data:
-                return
-            self.wfile.write(('%x\r\n' % len(data)).encode('ascii'))
-            self.wfile.write(data)
-            self.wfile.write(b'\r\n')
-
-        with ch.lock:
-            keys = list(ch.order)
-            start_keys = keys[-2:] if len(keys) > 2 else keys
-            start_segs = [(ch.segments[k][0], ch.segments[k][3]) for k in start_keys if k in ch.segments]
-        last_seq = (min(s[0] for s in start_segs) - 1) if start_segs else 0
-
-        empty = 0
-        fail = 0
-        try:
-            while True:
-                with ch.lock:
-                    cur = [(s[0], s[3]) for k in ch.order
-                           for s in [ch.segments.get(k)] if s and s[0] > last_seq]
-                cur.sort(key=lambda x: x[0])
-                if not cur:
-                    empty += 1
-                    if empty > 600:
-                        break
-                    time.sleep(0.3)
-                    continue
-                empty = 0
-                for seq, url in cur:
-                    try:
-                        req = urllib.request.Request(url, headers={
-                            'User-Agent': UA,
-                            'Referer': 'https://live.cctv.cn/',
-                        })
-                        with urllib.request.urlopen(req, timeout=15) as r:
-                            while True:
-                                chunk = r.read(64 * 1024)
-                                if not chunk:
-                                    break
-                                _write_chunk(chunk)
-                        self.wfile.flush()
-                        last_seq = seq
-                        ch.last_access = time.time()
-                        fail = 0
-                    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
-                        return
-                    except Exception:
-                        fail += 1
-                        last_seq = seq
-                        if fail > 20:
-                            return
-                time.sleep(0.1)
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
-            pass
-        except Exception as e:
-            _log('%s ts err %s' % (ch.slug, e))
-
-
-def _ensure_local_server():
-    global _LOCAL_PORT
-    with _LOCAL_LOCK:
-        if _LOCAL_PORT is not None:
-            return _LOCAL_PORT
-        ports = list(range(LOCAL_PORT_PREFERRED, LOCAL_PORT_PREFERRED + LOCAL_PORT_RANGE)) + [0]
-        last_err = None
-        for port in ports:
-            try:
-                srv = ThreadingHTTPServer(('127.0.0.1', port), _LocalHandler)
-                srv.daemon_threads = True
-                _LOCAL_PORT = srv.server_address[1]
-                threading.Thread(target=srv.serve_forever, daemon=True).start()
-                _log('本地服务已启动: http://127.0.0.1:%d/' % _LOCAL_PORT)
-                return _LOCAL_PORT
-            except OSError as e:
-                last_err = e
-                continue
-        raise RuntimeError('无法绑定端口: %s' % last_err)
-
-
 # ================================================================ Spider
 
 class Spider(SpiderBase):
@@ -914,10 +708,7 @@ class Spider(SpiderBase):
         self.brandDirector = "ysp-live"
 
     def init(self, extend=""):
-        try:
-            _ensure_local_server()
-        except Exception as e:
-            _log('本地服务启动失败: %s' % e)
+        # 直接 CDN 模式: 无需本地中继服务, 仅预热后台刷新线程
         return True
 
     def getName(self): return "央视频直播"
@@ -972,14 +763,10 @@ class Spider(SpiderBase):
         info = CHANNEL_MAP.get(slug)
         if not info:
             return {"list": []}
-        try:
-            _ensure_local_server()
-            ch = CHANNEL_STATE.get(slug)
-            if ch:
-                _ensure_channel(ch)
-        except Exception:
-            pass
-        full_desc = "【📺 央视频直播】\n频道: %s\nHLS 直播, 本地分片转发。" % info['name']
+        ch = CHANNEL_STATE.get(slug)
+        if ch:
+            _ensure_channel(ch)
+        full_desc = "【📺 央视频直播】\n频道: %s\nHLS 直播, 播放器直连央视 CDN。" % info['name']
         escaped_desc = (full_desc.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
         vod = {"vod_id": slug, "vod_name": info['name'], "vod_pic": LOGO_MAP.get(slug, ""),
                "vod_actor": self.brandActor, "vod_director": self.brandDirector,
@@ -997,32 +784,13 @@ class Spider(SpiderBase):
                     "header": {"User-Agent": UA, "Referer": "https://live.cctv.cn/"}}
         if slug not in CHANNEL_STATE:
             return {"parse": 0, "playUrl": "", "url": "", "header": {}}
-
-        try:
-            port = _ensure_local_server()
-        except Exception:
-            info = CHANNEL_MAP[slug]
-            url = ''
-            try:
-                now = int(time.time())
-                url = jce_timeshift_url(info['pid'], info['sid'], now - WINDOW, now, info['defn'])
-            except Exception:
-                pass
-            return {"parse": 0, "playUrl": "", "url": url,
-                    "header": {"User-Agent": UA, "Referer": "https://live.cctv.cn/"}}
-
         ch = CHANNEL_STATE[slug]
         _ensure_channel(ch)
-        for _ in range(40):
-            with ch.lock:
-                if ch.order:
-                    break
-            time.sleep(0.5)
-
+        # 经网关反向代理, 播放器直连央视 CDN 分片; 此处只给清单地址
         return {
             "parse": 0,
             "playUrl": "",
-            "url": "http://127.0.0.1:%d/%s.m3u8" % (port, slug),
+            "url": "/aptv/%s.m3u8" % slug,
             "header": {
                 "User-Agent": UA,
                 "Referer": "https://live.cctv.cn/",
@@ -1047,41 +815,20 @@ class Spider(SpiderBase):
 # ================================================================ 本地调试
 
 if __name__ == '__main__':
-    import argparse, sys
+    import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument('--port', type=int, default=LOCAL_PORT_PREFERRED)
-    ap.add_argument('--once', action='store_true')
     ap.add_argument('--test-slug', default='cctv1')
     args = ap.parse_args()
-    LOCAL_PORT_PREFERRED = args.port
 
     sp = Spider(); sp.init()
     print("homeContent:", json.dumps(sp.homeContent({}), ensure_ascii=False))
     cc = sp.categoryContent('cctv', 1, {}, {})
     print("cctv: %d 个频道" % cc['total'])
-    dc = sp.detailContent([args.test_slug])
-    if dc['list']:
-        print("detail:", dc['list'][0]['vod_name'], dc['list'][0]['vod_play_url'])
-    pc = sp.playerContent('', args.test_slug, [])
-    print("playerContent:", json.dumps(pc, ensure_ascii=False))
-
-    if args.once:
-        time.sleep(3)
-        try:
-            with urllib.request.urlopen(pc['url'], timeout=10) as r:
-                print(r.read().decode('utf-8', 'replace')[:600])
-        except Exception as e:
-            print("错误:", e)
-        sys.exit(0)
-
-    port = _LOCAL_PORT
-    print("\n" + "=" * 60)
-    print("常驻模式 (Ctrl+C 退出)")
-    print("  m3u8 : http://127.0.0.1:%d/%s.m3u8" % (port, args.test_slug))
-    print("  diag : http://127.0.0.1:%d/diag" % port)
-    print("=" * 60)
-    try:
-        while True:
-            time.sleep(3600)
-    except KeyboardInterrupt:
-        pass
+    slave = CHANNEL_STATE[args.test_slug]
+    _ensure_channel(slave)
+    for _ in range(20):
+        pl = build_playlist(slave)
+        if pl:
+            break
+        time.sleep(1)
+    print("playlist(%s):\n%s" % (args.test_slug, (pl or 'EMPTY')[:600]))

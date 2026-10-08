@@ -5,8 +5,10 @@ Two shapes are supported:
 * ``live``  - a CatVod live spider exposing ``liveContent`` / ``localProxy``
               (used by 广东广电).  Channels point at ``/proxy?...``.
 * ``aptv``  - a TVBox vod-style spider exposing ``homeContent`` /
-              ``categoryContent`` and an internal HLS relay (used by APTV /
-              央视频).  Channels point at ``/aptv/<slug>.m3u8``.
+              ``categoryContent``.  It serves a direct-CDN HLS playlist
+              (optimized from waastudios/ysptp-docker) so the player pulls
+              segments straight from CCTV's CDN; channels point at
+              ``/aptv/<slug>.m3u8``.
 """
 
 import importlib
@@ -179,11 +181,27 @@ class AptvProvider(Provider):
                 groups.append({"name": name, "channel": channels})
         return groups
 
-    def local_port(self):
+    def aptv_playlist(self, slug):
+        """Build the direct-CDN m3u8 for ``slug`` from the APTV spider."""
         spider = self.ensure()
-        if spider is None or self.module is None:
+        if spider is None:
             raise RuntimeError(self.error or "provider unavailable")
-        return int(self.module._ensure_local_server())
+        module = self.module
+        ch = module.CHANNEL_STATE.get(slug)
+        if ch is None:
+            raise RuntimeError("unknown channel: %s" % slug)
+        module._ensure_channel(ch)
+        playlist = module.build_playlist(ch)
+        if not playlist:
+            # 首拉可能尚未拿到数据, 给后台线程一点时间刷新
+            for _ in range(20):
+                playlist = module.build_playlist(ch)
+                if playlist:
+                    break
+                time.sleep(1)
+        if not playlist:
+            raise RuntimeError("频道 %s 暂无数据: %s" % (slug, ch.last_error or "拉取中"))
+        return playlist
 
 
 PROVIDERS = [AptvProvider(c) if c.get("kind") == "aptv" else Provider(c) for c in SOURCES]

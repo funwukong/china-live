@@ -2,9 +2,10 @@
 
 Serves the bundled providers as one M3U catalogue:
 
-* ``aptv`` (央视频, APTV spider) exposes its own local HLS relay.  Its manifest
-  references ``http://127.0.0.1:<port>``, so this gateway reverse-proxies the
-  relay and rewrites chunk URLs before handing the playlist to the player.
+* ``aptv`` (央视频, APTV spider) serves a direct-CDN HLS playlist at
+  ``/aptv/<slug>.m3u8``.  The player pulls segments straight from CCTV's CDN,
+  so this gateway only forwards the small manifest (no local relay, no
+  chunk rewriting) -- optimized from waastudios/ysptp-docker.
 * ``gdtv`` (广东广电) resolves the live manifest through ``/proxy?sp=gdtv``.
 
 Port defaults to 8577 and is overridable with the PORT env var.
@@ -17,7 +18,6 @@ import os
 import re
 import threading
 import time
-import urllib.error
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -28,7 +28,6 @@ HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8577"))
 BASE_URL = os.environ.get("BASE_URL", "")
 CATALOG_TTL = 600
-RELAY_TIMEOUT = 30
 
 _lock = threading.Lock()
 
@@ -255,56 +254,27 @@ class Handler(BaseHTTPRequestHandler):
         self._send(code, body, ctype, headers)
 
     def _aptv(self, path):
-        """Reverse-proxy the APTV spider's on-box HLS relay.
-
-        The spider hands out ``http://127.0.0.1:<port>/...`` URLs, which only
-        resolve on the same host.  We fetch the playlist locally and rewrite its
-        chunk URLs to this gateway so remote players work.
+        """Forward the APTV spider's direct-CDN m3u8 for one channel.
+        The manifest already points at CCTV's public CDN, so we only hand it
+        to the player -- no local relay, no chunk rewriting.
         """
         provider = providers.PROVIDER_MAP.get("aptv")
         if provider is None:
             self._send(404, "aptv source not configured\n")
             return
-        relative = path[len("/aptv"):]
-
-        playlist = re.fullmatch(r"/([\w]+)\.m3u8", relative)
-        chunk = re.fullmatch(r"/chunk/([\w]+)/(\d+)\.ts", relative)
-        if not playlist and not chunk:
+        match = re.fullmatch(r"/([\w]+)\.m3u8", path[len("/aptv"):])
+        if not match:
             self._send(404, "not found\n")
             return
-
+        slug = match.group(1)
+        started = time.time()
         try:
-            port = provider.local_port()
+            body = provider.aptv_playlist(slug)
         except Exception as error:
-            self._send(502, "aptv relay unavailable: %s\n" % error)
+            self._send(503, "频道 %s 暂不可用: %s\n" % (slug, error))
             return
-
-        target = "http://127.0.0.1:%d%s" % (port, relative)
-        try:
-            request = urllib.request.Request(target, headers={"User-Agent": "china-live"})
-            with urllib.request.urlopen(request, timeout=RELAY_TIMEOUT) as response:
-                code = response.status
-                ctype = response.headers.get("Content-Type", "application/octet-stream")
-                body = response.read()
-        except urllib.error.HTTPError as error:
-            self._send(error.code, "relay HTTP %d\n" % error.code)
-            return
-        except Exception as error:
-            self._send(502, "relay error: %s\n" % error)
-            return
-
-        if playlist:
-            text = body.decode("utf-8", "replace")
-            text = re.sub(
-                r"http://127\.0\.0\.1:%d/chunk/([\w]+)/(\d+)\.ts" % port,
-                lambda match: "%s/aptv/chunk/%s/%s.ts"
-                % (_base_url(self), match.group(1), match.group(2)),
-                text,
-            )
-            self._send(code, text, "application/vnd.apple.mpegurl")
-            return
-
-        self._send(code, body, ctype)
+        log("aptv %s -> m3u8 (%.2fs)" % (slug, time.time() - started))
+        self._send(200, body, "application/vnd.apple.mpegurl")
 
 
 def main():
