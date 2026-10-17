@@ -6,13 +6,25 @@ services:
     restart: unless-stopped
     ports:
       - "${PORT:-8577}:8577"
+    volumes:
+      # Device identity + playlist cache survive a container rebuild.
+      - ./data:/app/data
     environment:
       TZ: Asia/Shanghai
       PORT: 8577
       HOST: 0.0.0.0
+      CHINA_LIVE_DATA_DIR: /app/data
+      # ysp-live engine knobs (all optional, defaults shown).
+      # YSP_NO_DEVICE=1        # disable device protocol, 1080p only
+      # YSP_ONLY_4K=1          # only 4K/8K channels use the device protocol
+      # YSP_LINKS_PER_DEVICE=6 # concurrent high-bitrate streams per device
+      # YSP_ZAP_DEBOUNCE=10    # seconds before ramping up bitrate after a zap
+      # YSP_CACHE_MB=200       # in-RAM TS segment cache for /proxy.ts
+      # YSP_NO_ENGINE=1        # disable the Node WASM companion engine
+      # YSP_ENGINE_PORT=8578   # port for the companion engine (0 = PORT+1)
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8577/health', timeout=5).read()"]
       interval: 30s
       timeout: 5s
-      start_period: 5s
+      start_period: 15s
       retries: 3

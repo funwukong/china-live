@@ -8,4 +8,5 @@ Dockerfile
 docker-compose.yml
 .dockerignore
 README.md
+data/
 artifacts/

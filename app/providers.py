@@ -1,14 +1,16 @@
 """Loads and caches the bundled live providers.
 
-Two shapes are supported:
+Three shapes are supported:
 
 * ``live``  - a CatVod live spider exposing ``liveContent`` / ``localProxy``
               (used by 广东广电).  Channels point at ``/proxy?...``.
-* ``aptv``  - a TVBox vod-style spider exposing ``homeContent`` /
-              ``categoryContent``.  It serves a direct-CDN HLS playlist
-              (optimized from waastudios/ysptp-docker) so the player pulls
-              segments straight from CCTV's CDN; channels point at
-              ``/aptv/<slug>.m3u8``.
+* ``aptv``  - the legacy JCE + bkliveinfo spider (kept as a pure-stdlib
+              fallback; channels point at ``/aptv/<slug>.m3u8``).
+* ``ysp``   - the vendored ysp-live v9.5 engine (央视频设备协议).  It provides
+              real 4K/8K, 7-day catchup and the aggregated EPG; channels point
+              at ``/ysp/<slug>.m3u8`` and TS segments are relayed through
+              ``/proxy.ts`` because the device protocol needs signed playback
+              headers.
 """
 
 import importlib
@@ -18,9 +20,26 @@ import time
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 LIVE_DIR = os.path.join(APP_DIR, "live")
+DATA_DIR = os.environ.get("CHINA_LIVE_DATA_DIR", os.path.join(APP_DIR, "data"))
 CATALOG_CACHE_SECONDS = 600
 
 SOURCES = [
+    {
+        "key": "ysp",
+        "module": "live.ysp",
+        "kind": "ysp",
+        "url": "",
+        "ext": "",
+        "timeout": 30,
+        # ysp engine knobs (see app/live/ysp/runtime.py)
+        "engine_port": int(os.environ.get("YSP_ENGINE_PORT", "0") or 0),
+        "no_device": os.environ.get("YSP_NO_DEVICE", "").lower() in ("1", "true", "yes"),
+        "only_4k": os.environ.get("YSP_ONLY_4K", "").lower() in ("1", "true", "yes"),
+        "links_per_device": int(os.environ.get("YSP_LINKS_PER_DEVICE", "6") or 0),
+        "zap_debounce": float(os.environ.get("YSP_ZAP_DEBOUNCE", "10") or 0),
+        "cache_mb": int(os.environ.get("YSP_CACHE_MB", "200") or 0),
+        "no_engine": os.environ.get("YSP_NO_ENGINE", "").lower() in ("1", "true", "yes"),
+    },
     {
         "key": "aptv",
         "module": "live.cctv",
@@ -55,6 +74,7 @@ class Provider:
         self.module_name = config["module"]
         self.kind = config.get("kind", "live")
         self.timeout = int(config.get("timeout") or 20)
+        self.config = config
         self.lock = threading.RLock()
         self.spider = None
         self.module = None
@@ -204,5 +224,119 @@ class AptvProvider(Provider):
         return playlist
 
 
-PROVIDERS = [AptvProvider(c) if c.get("kind") == "aptv" else Provider(c) for c in SOURCES]
+class YspProvider(Provider):
+    """Adapter for the vendored ysp-live v9.5 engine (央视频设备协议).
+
+    Unlike the other providers this one boots a long-lived runtime: a
+    registered CCTV device identity, a heartbeat keeper and the optional
+    Node WASM companion engine.  The catalogue is static, so it is read
+    straight from the engine's channel directory.
+    """
+
+    kind = "ysp"
+
+    def ensure(self):
+        with self.lock:
+            if self.spider is not None or self.error is not None:
+                return self.spider
+            try:
+                module = importlib.import_module(self.module_name)
+                from live.ysp.runtime import YspRuntime
+            except Exception as error:
+                self.error = "import failed: %s" % error
+                log("%s %s" % (self.key, self.error))
+                return None
+            try:
+                runtime = YspRuntime(
+                    data_dir=DATA_DIR,
+                    port=self.port,
+                    engine_port=self.config.get("engine_port") or 0,
+                    no_device=bool(self.config.get("no_device")),
+                    only_4k=bool(self.config.get("only_4k")),
+                    links_per_device=self.config.get("links_per_device", 6),
+                    zap_debounce=self.config.get("zap_debounce", 10.0),
+                    cache_mb=self.config.get("cache_mb", 200),
+                    start_engine=not self.config.get("no_engine"),
+                    log=lambda msg: log("%s" % msg),
+                )
+                runtime.start()
+            except Exception as error:
+                self.error = "start failed: %s" % error
+                log("%s %s" % (self.key, self.error))
+                return None
+            self.module = module
+            self.spider = runtime
+            return runtime
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.config = config
+        self.port = int(os.environ.get("PORT", "8577") or 8577)
+
+    def title(self):
+        return "央视频 (设备协议 v9.5)"
+
+    def build_catalog(self, runtime):
+        groups = runtime.catalog()
+        for group in groups:
+            for channel in group["channel"]:
+                slug = channel.pop("slug")
+                channel["urls"] = ["/ysp/%s.m3u8" % slug]
+                channel["catchup"] = bool(channel.get("catchup"))
+        return groups
+
+    def playlist(self, slug, host_header, proto="http", catchup=None):
+        runtime = self.ensure()
+        if runtime is None:
+            raise RuntimeError(self.error or "provider unavailable")
+        return runtime.playlist(slug, host_header, proto, catchup)
+
+    def epg_xml(self):
+        runtime = self.ensure()
+        if runtime is None:
+            raise RuntimeError(self.error or "provider unavailable")
+        return runtime.epg_xml()
+
+    def epg_status(self):
+        runtime = self.ensure()
+        return runtime.epg_status() if runtime is not None else {"available": False}
+
+    def health(self):
+        runtime = self.ensure()
+        return runtime.health() if runtime is not None else {"error": self.error}
+
+    def diag_lines(self):
+        runtime = self.ensure()
+        return runtime.diag_lines() if runtime is not None else "ysp: unavailable\n"
+
+    def ts_relay_token(self, path_with_query):
+        """Decode a ``/proxy.ts?=token`` request into the upstream TS URL."""
+        runtime = self.ensure()
+        if runtime is None:
+            raise RuntimeError(self.error or "provider unavailable")
+        return runtime.decode_ts_token(path_with_query)
+
+    def playback_headers(self, real_url):
+        runtime = self.ensure()
+        return runtime.playback_headers(real_url) if runtime is not None else {}
+
+    def ts_cache(self):
+        runtime = self.ensure()
+        return runtime.ts_cache() if runtime is not None else None
+
+    def destroy(self):
+        runtime, self.spider = self.spider, None
+        self.module = None
+        self.groups = []
+        if runtime is not None:
+            try:
+                runtime.stop()
+            except Exception:
+                pass
+
+
+_KINDS = {"aptv": AptvProvider, "ysp": YspProvider}
+
+PROVIDERS = [_KINDS[c["kind"]](c) if c.get("kind") in _KINDS else Provider(c)
+             for c in SOURCES]
 PROVIDER_MAP = {provider.key: provider for provider in PROVIDERS}

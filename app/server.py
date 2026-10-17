@@ -2,11 +2,14 @@
 
 Serves the bundled providers as one M3U catalogue:
 
-* ``aptv`` (央视频, APTV spider) serves a direct-CDN HLS playlist at
-  ``/aptv/<slug>.m3u8``.  The player pulls segments straight from CCTV's CDN,
-  so this gateway only forwards the small manifest (no local relay, no
-  chunk rewriting) -- optimized from waastudios/ysptp-docker.
+* ``ysp`` (央视频 ysp-live v9.5, the CCTV device protocol) serves ``/ysp/<slug>.m3u8``.
+  Real 4K/8K streams are signed, so TS segments must be relayed by us through
+  ``/proxy.ts``; 1080p/7-day-catchup playlists can point straight at the CDN.
+* ``aptv`` (legacy JCE + bkliveinfo spider) serves a direct-CDN HLS playlist at
+  ``/aptv/<slug>.m3u8`` -- the player pulls segments straight from CCTV's CDN.
 * ``gdtv`` (广东广电) resolves the live manifest through ``/proxy?sp=gdtv``.
+
+``/epg.xml`` aggregates the upstream XMLTV feeds for the ysp channel set.
 
 Port defaults to 8577 and is overridable with the PORT env var.
 """
@@ -80,6 +83,10 @@ def _extinf(channel, group_name):
         value = channel.get(key)
         if isinstance(value, str) and value:
             parts.append('%s="%s"' % (attr, value.replace('"', "'")))
+    if channel.get("catchup"):
+        parts.append('catchup="append"')
+        parts.append('catchup-days="7"')
+        parts.append('catchup-source="?playseek=${(b)yyyyMMddHHmmss}-${(e)yyyyMMddHHmmss}"')
     parts.append('group-title="%s"' % group_name.replace('"', "'"))
     name = str(channel.get("name") or channel.get("tvgName") or "")
     return "#EXTINF:" + " ".join(parts) + "," + name
@@ -88,7 +95,7 @@ def _extinf(channel, group_name):
 def _m3u(handler, key=None):
     origin = _base_url(handler)
     groups, errors = _catalog(key)
-    lines = ["#EXTM3U"]
+    lines = ['#EXTM3U url-tvg="%s/epg.xml"' % origin]
     total = 0
     for source_key, group_name, channels in groups:
         label = "%s / %s" % (providers.PROVIDER_MAP[source_key].title(), group_name)
@@ -139,7 +146,7 @@ def _index(handler):
         "code{background:#f2f2f7;padding:2px 6px;border-radius:4px}"
         "</style></head><body><h2>China Live</h2>"
         "<p>聚合订阅：<a href=\"/all.m3u\"><code>/all.m3u</code></a> —— 一次性导入播放器。</p>"
-        "<p>健康探针 <code>/health</code> · 诊断 <code>/diag</code></p>"
+        "<p>节目单：<code>/epg.xml</code> · 健康探针 <code>/health</code> · 诊断 <code>/diag</code></p>"
         "<ul>%s</ul></body></html>" % "".join(cards)
     )
 
@@ -161,15 +168,63 @@ def _diag():
         except Exception as error:
             state = "error: %s" % error
         lines.append("%-6s %-12s %s" % (provider.key, provider.title(), state))
+    ysp = providers.PROVIDER_MAP.get("ysp")
+    if ysp is not None:
+        try:
+            lines.append("")
+            lines.append(ysp.diag_lines().rstrip())
+        except Exception as error:
+            lines.append("ysp diag error: %s" % error)
     return "\n".join(lines) + "\n"
 
 
+def _health():
+    payload = {"ok": True, "port": PORT, "sources": {}}
+    for provider in providers.PROVIDERS:
+        entry = {"name": provider.title()}
+        try:
+            groups = provider.catalog()
+            entry["channels"] = sum(
+                len(group.get("channel") or [])
+                for group in groups if isinstance(group.get("channel"), list))
+        except Exception as error:
+            entry["error"] = str(error)
+        if provider.kind == "ysp":
+            try:
+                entry["engine"] = provider.health()
+                entry["epg"] = provider.epg_status()
+                engine = entry.get("engine") or {}
+                if engine.get("device_error"):
+                    # The 1080p fallback still serves, so this is degraded, not down.
+                    entry["ok"] = False
+            except Exception as error:
+                entry["error"] = str(error)
+                entry["ok"] = False
+        payload["sources"][provider.key] = entry
+        if entry.get("ok") is False:
+            payload["ok"] = False
+    return payload
+
+
 class Handler(BaseHTTPRequestHandler):
-    server_version = "china-live/1.2"
+    server_version = "china-live/2.0"
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):
         pass
+
+    def handle_one_request(self):
+        """Swallow client disconnects.
+
+        Players routinely abort a segment mid-transfer (zapping, buffer
+        changes, timeouts).  With HTTP/1.1 keep-alive and large TS bodies
+        those surface as BrokenPipeError/ConnectionResetError and would
+        otherwise print a traceback per abort.
+        """
+        try:
+            BaseHTTPRequestHandler.handle_one_request(self)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            self.close_connection = True
 
     def _send(self, code, body, ctype="text/plain; charset=utf-8", headers=None):
         data = body.encode("utf-8") if isinstance(body, str) else body
@@ -195,7 +250,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, _index(self), "text/html; charset=utf-8")
             return
         if path == "/health":
-            self._send(200, "ok\n")
+            payload = _health()
+            self._send(200, json.dumps(payload, ensure_ascii=False, indent=2),
+                       "application/json; charset=utf-8")
             return
         if path == "/diag":
             self._send(200, _diag())
@@ -213,8 +270,17 @@ class Handler(BaseHTTPRequestHandler):
                 log("all.m3u partial: %s" % "; ".join(errors))
             self._send(code, body, "application/vnd.apple.mpegurl; charset=utf-8")
             return
+        if path == "/epg.xml":
+            self._epg()
+            return
         if path == "/proxy":
             self._proxy(urllib.parse.parse_qs(parsed.query))
+            return
+        if path.startswith("/proxy.ts"):
+            self._ts_relay(self.path)
+            return
+        if path.startswith("/ysp/"):
+            self._ysp(path, urllib.parse.parse_qs(parsed.query))
             return
         if path.startswith("/aptv/"):
             self._aptv(path)
@@ -276,11 +342,153 @@ class Handler(BaseHTTPRequestHandler):
         log("aptv %s -> m3u8 (%.2fs)" % (slug, time.time() - started))
         self._send(200, body, "application/vnd.apple.mpegurl")
 
+    def _epg(self):
+        provider = providers.PROVIDER_MAP.get("ysp")
+        if provider is None:
+            self._send(404, "no EPG source\n")
+            return
+        started = time.time()
+        try:
+            xml = provider.epg_xml()
+        except Exception as error:
+            self._send(502, "EPG fetch failed: %s\n" % error)
+            return
+        log("epg.xml -> %d bytes (%.2fs)" % (len(xml), time.time() - started))
+        self._send(200, xml, "application/xml; charset=utf-8")
+
+    def _ysp(self, path, query):
+        """Serve a ysp-live v9.5 HLS manifest for one channel.
+
+        Honours the ``?playseek=...`` catchup query used by the
+        ``catchup="append"`` entries emitted into the M3U.
+        """
+        provider = providers.PROVIDER_MAP.get("ysp")
+        if provider is None:
+            self._send(404, "ysp source not configured\n")
+            return
+        match = re.fullmatch(r"/ysp/([\w-]+)\.m3u8", path)
+        if not match:
+            self._send(404, "not found\n")
+            return
+        slug = match.group(1)
+        host = self.headers.get("Host") or "%s:%d" % (HOST, PORT)
+        proto = (self.headers.get("X-Forwarded-Proto") or "http").split(",")[0].strip()
+        if proto not in ("http", "https"):
+            proto = "http"
+        catchup = _parse_catchup(query)
+        started = time.time()
+        try:
+            body = provider.playlist(slug, host, proto, catchup)
+        except Exception as error:
+            if "未知频道" in str(error):
+                self._send(404, "unknown channel: %s\n" % slug)
+                return
+            self._send(503, "频道 %s 暂不可用: %s\n" % (slug, error))
+            return
+        log("ysp %s -> m3u8%s (%.2fs)"
+            % (slug, " catchup" if catchup else "", time.time() - started))
+        self._send(200, body, "application/vnd.apple.mpegurl")
+
+    def _ts_relay(self, request_path):
+        """Relay one .ts segment for a signed 4K/8K stream.
+
+        The device protocol issues CDN URLs that require signed playback
+        headers, so the segment cannot be handed to the player directly.
+        A small in-RAM cache absorbs repeat fetches; range requests bypass it.
+        """
+        provider = providers.PROVIDER_MAP.get("ysp")
+        if provider is None:
+            self._send(404, "ysp source not configured\n")
+            return
+        try:
+            real_url = provider.ts_relay_token(request_path)
+        except Exception as error:
+            # A forbidden host is the SSRF guard tripping, not a bad request.
+            code = 403 if "forbidden" in str(error) else 400
+            self._send(code, "%s\n" % error)
+            return
+        range_header = self.headers.get("Range")
+        cache = provider.ts_cache()
+        cached = cache.get(real_url) if (cache is not None and not range_header) else None
+        if cached is not None:
+            data, headers = cached
+            self._send(200, data, headers.get("Content-Type", "video/mp2t"),
+                       {"X-Cache": "HIT-RAM"})
+            return
+        playback = provider.playback_headers(real_url)
+        try:
+            request = urllib.request.Request(real_url, headers=playback)
+            if range_header:
+                request.add_header("Range", range_header)
+            with urllib.request.urlopen(request, timeout=30) as response:
+                data = response.read()
+                ctype = response.headers.get("Content-Type", "video/mp2t")
+        except Exception as error:
+            self._send(502, "upstream segment error: %s\n" % error)
+            return
+        if cache is not None and not range_header and len(data) <= 35 * 1024 * 1024:
+            try:
+                cache.set(real_url, data, {"Content-Type": ctype})
+            except Exception:
+                pass
+        self._send(200, data, ctype, {"X-Cache": "MISS-UPSTREAM"})
+
+
+def _parse_catchup(query):
+    """Translate a catchup query dict (parse_qs) into an (start_ts, end_ts) pair."""
+    values = {key: item[-1] for key, item in query.items()}
+    playseek = values.get("playseek")
+    if playseek and "-" in playseek:
+        start_raw, end_raw = playseek.split("-", 1)
+        start = _parse_time(start_raw)
+        end = _parse_time(end_raw)
+        if start and end and end > start:
+            return start, end
+        return None
+    start = _parse_time(values.get("start") or values.get("utc")
+                        or values.get("starttime"))
+    end = _parse_time(values.get("end") or values.get("lutc")
+                      or values.get("endtime"))
+    if start and end and end > start:
+        return start, end
+    return None
+
+
+def _parse_time(value):
+    """Accept yyyyMMddHHmmss (local) or a raw unix timestamp."""
+    if not value:
+        return None
+    value = value.strip()
+    if value.isdigit():
+        if len(value) == 14:
+            # yyyyMMddHHmmss must win over the raw-timestamp branch below.
+            try:
+                return int(datetime.datetime.strptime(value, "%Y%m%d%H%M%S").timestamp())
+            except ValueError:
+                return None
+        if len(value) >= 10:
+            return int(value)
+        return None
+    for fmt in ("%Y%m%d%H%M%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return int(datetime.datetime.strptime(value, fmt).timestamp())
+        except ValueError:
+            continue
+    return None
+
+
+class Server(ThreadingHTTPServer):
+    """Daemon threads so a stuck TS relay cannot block container shutdown."""
+
+    daemon_threads = True
+    allow_reuse_address = True
+
 
 def main():
-    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    server = Server((HOST, PORT), Handler)
     log("china-live 启动: %d 个源, 监听 %s:%d" % (len(providers.PROVIDERS), HOST, PORT))
     log("首页: http://127.0.0.1:%d/" % PORT)
+    log("节目单: http://127.0.0.1:%d/epg.xml" % PORT)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

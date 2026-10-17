@@ -1,3 +1,4 @@
-# APTV (live/cctv.py) is pure standard library.
+# live/cctv.py (legacy aptv fallback) and live/ysp/engine.py are pure standard library.
+# Only the gdtv spider needs these.
 requests==2.32.3
 websocket-client==1.8.0
