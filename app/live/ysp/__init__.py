@@ -1,4 +1,4 @@
-"""ysp-live v9.5 engine package (vendored from waastudios/ysptp-docker).
+"""ysp-live v9.8 engine package (vendored from waastudios/ysptp-docker).
 
 The engine core (``engine.py``) is vendored unmodified apart from the EPG
 import path so upstream fixes can be re-vendored by replacing that one file.
