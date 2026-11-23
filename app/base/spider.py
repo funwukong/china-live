@@ -16,6 +16,7 @@ class Spider:
 
     def __init__(self):
         self.net = Net()
+        self.local = _LocalStore()
 
     def init(self, extend=""):
         pass
@@ -37,3 +38,15 @@ class Spider:
         if self.key:
             params.setdefault("sp", self.key)
         return (self.proxy_base or "") + "/proxy?" + urllib.parse.urlencode(params)
+
+
+class _LocalStore:
+
+    def __init__(self):
+        self._data = {}
+
+    def get(self, key, default=None):
+        return self._data.get(key, default)
+
+    def set(self, key, value):
+        self._data[key] = value

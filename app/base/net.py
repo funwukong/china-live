@@ -8,7 +8,9 @@ requests / websocket-client so the spiders can run outside the player.
 import json
 import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 
 import requests
 
@@ -175,3 +177,40 @@ class Net:
             return json.loads(result["content"])
         except (TypeError, ValueError) as error:
             raise ValueError("invalid json: %s" % error) from None
+
+    def clearCache(self, key):
+        with self._guard:
+            self._cache.pop(key, None)
+            self._locks.pop(key, None)
+
+    def openStream(self, url, options=None):
+        """Streaming reader used by the yangshipin spider to probe HLS media."""
+        options = options or {}
+        request = urllib.request.Request(url, headers=dict(options.get("headers") or {}), method="GET")
+        try:
+            response = urllib.request.urlopen(request, timeout=_timeout(options))
+        except urllib.error.HTTPError as error:
+            return _StreamResult(error.code, error.headers.get("Content-Type", ""), error)
+        except Exception:
+            return _StreamResult(0, "", None)
+        return _StreamResult(response.status, response.headers.get("Content-Type", ""), response)
+
+
+class _StreamResult:
+
+    def __init__(self, code, content_type, handle):
+        self.code = code
+        self.contentType = content_type or ""
+        self._handle = handle
+
+    def read(self, size):
+        if self._handle is None or self.code not in (200, 206):
+            return b""
+        return self._handle.read(size)
+
+    def close(self):
+        if self._handle is not None:
+            try:
+                self._handle.close()
+            except Exception:
+                pass

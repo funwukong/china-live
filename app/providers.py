@@ -56,6 +56,22 @@ SOURCES = [
         "ext": "",
         "timeout": 20,
     },
+    {
+        "key": "yangshipin",
+        "module": "live.yangshipin",
+        "kind": "live",
+        "url": "",
+        "ext": "file://yangshipin.json",
+        "timeout": 30,
+    },
+    {
+        "key": "customlives",
+        "module": "live.customlives",
+        "kind": "live",
+        "url": "",
+        "ext": "",
+        "timeout": 30,
+    },
 ]
 
 
