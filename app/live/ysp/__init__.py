@@ -1,8 +1,9 @@
-"""ysp-live v9.8 engine package (vendored from waastudios/ysptp-docker).
+"""ysp-live v11.3 engine package (vendored upstream ysp-live).
 
-The engine core (``engine.py``) is vendored unmodified apart from the EPG
-import path so upstream fixes can be re-vendored by replacing that one file.
-``runtime.py`` adapts it to china-live's in-process gateway.
+``engine.py`` is vendored byte-for-byte from upstream v11.3, so upstream fixes
+can be re-vendored by replacing that one file.  ``runtime.py`` adapts it to
+china-live's in-process gateway and owns the EPG aggregator, which v11.3 no
+longer imports itself.
 """
 
 from .runtime import YspEngineError, YspRuntime

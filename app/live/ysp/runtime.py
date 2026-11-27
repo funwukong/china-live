@@ -1,22 +1,27 @@
-"""In-process runtime for the vendored ysp-live v9.5 engine.
+"""In-process runtime for the vendored ysp-live v11.3 engine.
 
-china-live ships its own HTTP gateway, so the upstream standalone server is not
-used.  Instead this module boots the upstream :class:`Resolver` (CCTV device
-protocol), the Node.js WASM companion engine and the EPG aggregator, then
-exposes the handful of primitives the gateway needs:
+china-live ships its own HTTP gateway, so the upstream standalone server
+(``engine.Handler`` / ``engine.main``) is not used.  This module boots the
+upstream module globals the engine expects (``server_port``, ``engine_port``,
+``resolver``, ``active_backend_channels``, ``global_ts_cache``), then exposes
+the primitives the gateway needs:
 
-* :meth:`YspRuntime.catalog`      -- channel groups for the M3U
-* :meth:`YspRuntime.playlist`     -- the four-layer fallback chain per channel
-* :meth:`YspRuntime.ts_relay`     -- the ``/proxy.ts`` stream relay
-* :meth:`YspRuntime.epg_xml`      -- aggregated XMLTV
-* :meth:`YspRuntime.health`       -- engine/session/device diagnostics
+* :meth:`YspRuntime.catalog`         -- channel groups for the M3U
+* :meth:`YspRuntime.playlist`        -- device protocol -> 1080p -> WASM chain
+* :meth:`YspRuntime.ts_relay_token`  -- ``/proxy.ts?=<token>`` decode
+* :meth:`YspRuntime.live_segment`    -- ``/live-segment.ts?url=&id=`` relay
+* :meth:`YspRuntime.replay_segment_request` -- ``/replay-segment.ts`` relay
+* :meth:`YspRuntime.epg_xml`         -- aggregated XMLTV
+* :meth:`YspRuntime.health`          -- engine/session/device diagnostics
 
-The engine's own ``Handler``/``main()`` are left untouched; only the module
-globals it expects at runtime (``server_port``, ``resolver``,
-``active_backend_channels``, ``global_ts_cache``) are set from here.
+v11.3 dropped the ``epg_agg`` import that v9.8 carried, so the aggregator is
+now constructed here from the vendored ``epg.py`` and fed the engine's own
+``TVG_IDS`` mapping; the engine file stays byte-identical to upstream.
 """
 
 import argparse
+import hashlib
+import hmac
 import importlib.util
 import os
 import shutil
@@ -31,22 +36,23 @@ ENGINE_PATH = os.path.join(HERE, "engine.py")
 EPG_PATH = os.path.join(HERE, "epg.py")
 ENGINE_JS = os.path.join(HERE, "engine.js")
 
-# Upstream reads the EPG module by its original name.
+# The aggregator is loaded under its upstream module name.
 _EPG_MODULE_NAME = "epg_agg"
 
 # The Node companion only speaks to CCTV-family CDNs; upstream already
-# allow-lists the hosts, we only cap how long we let it run for.
+# allow-lists the hosts, we only cap how long we let it boot for.
 ENGINE_BOOT_TIMEOUT = 20.0
 
 # ``/proxy.ts`` accepts a *stateless* base64 token, so it is a public open
-# relay unless the target host is pinned. Upstream relies on "only we issue
-# tokens", which is not a boundary -- anyone can base64 their own URL. We
-# therefore allow-list the same CCTV-family suffixes the upstream engine proxy
-# uses (plus nothing else), which blocks SSRF against 127.0.0.1, the cloud
-# metadata address and RFC1918 hosts.
+# relay unless the target host is pinned.  We therefore allow-list the same
+# CCTV-family suffixes the upstream engine proxy uses (plus nothing else),
+# which blocks SSRF against 127.0.0.1, cloud metadata and RFC1918 hosts.
 TS_RELAY_ALLOWED_SUFFIXES = (
-    ".cctv.cn", ".cctv.com", ".yangshipin.cn", ".cntv.cn", ".cntv.com",
-    ".myqcloud.com", ".qqlive.com", ".gtimg.cn", ".alicdn.com", ".alikunlun.com",
+    ".cctv.cn", ".cctv.com", ".cctvpic.com", ".citvc.com", ".yangshipin.cn",
+    ".cntv.cn", ".cntv.com", ".myqcloud.com", ".qqlive.com", ".gtimg.cn",
+    ".smtcdns.net", ".smtcdns.com", ".tcdnlive.com", ".alicdn.com",
+    ".alikunlun.com", ".wscdns.com", ".chinanetcenter.com", ".bdydns.com",
+    ".ksyungslb.com", ".ks-cdn.com",
 )
 
 # Served while the first EPG pull is still warming up in the background.
@@ -73,7 +79,7 @@ class YspRuntime:
 
     def __init__(self, data_dir, port=8577, engine_port=0,
                  no_device=False, only_4k=False, links_per_device=6,
-                 zap_debounce=10.0, cache_mb=200, timeout=10.0,
+                 zap_debounce=0.0, cache_mb=200, timeout=10.0,
                  start_engine=True, log=print):
         self.data_dir = data_dir
         self.port = port
@@ -89,12 +95,12 @@ class YspRuntime:
 
         self.engine = None
         self.resolver = None
+        self.epg = None
         self._engine_proc = None
         self._lock = threading.RLock()
         self._ready = False
         self._last_error = ""
         self._device_ready_at = 0.0
-        self._epg_wanted = set()
 
     # ------------------------------------------------------------------ boot
 
@@ -104,12 +110,6 @@ class YspRuntime:
             if self.engine is not None:
                 return
             os.makedirs(self.data_dir, exist_ok=True)
-            # The engine imports ``epg_agg`` by name at module scope.
-            try:
-                _load_module(_EPG_MODULE_NAME, EPG_PATH)
-            except Exception as error:
-                self._last_error = "epg load failed: %s" % error
-                self.log("[ysp] %s (EPG 将不可用)" % self._last_error)
             self.engine = _load_module("ysp_engine", ENGINE_PATH)
             self.engine.server_port = self.port
             self.engine.engine_port = self.engine_port
@@ -128,11 +128,7 @@ class YspRuntime:
                     self.engine.BACKEND_CHANNELS)
 
             self.engine.resolve_paths(self._engine_args())
-            self._epg_wanted = {
-                self.engine.TVG_IDS.get(slug, slug.upper())
-                for slug in self.engine.global_channel_dir.canonical_slugs
-            }
-            self._rewire_epg()
+            self._build_epg()
 
             if not self.no_device:
                 self.resolver = self.engine.Resolver(self._engine_args())
@@ -141,11 +137,15 @@ class YspRuntime:
                 self.resolver.start_refresh_worker()
                 threading.Thread(target=self._init_device,
                                  daemon=True, name="ysp-device-init").start()
+            else:
+                self.engine.set_resolver_ready(False)
 
             if self.start_engine:
                 self._start_companion_engine()
+
             # Warm the EPG off the request path; a cold pull of both upstream
-            # XMLTV feeds takes ~2 minutes and must not block the first /epg.xml.
+            # XMLTV feeds takes ~2 minutes and must not block the first
+            # /epg.xml request.
             threading.Thread(target=self._warm_epg, daemon=True,
                              name="ysp-epg-warm").start()
 
@@ -176,12 +176,19 @@ class YspRuntime:
             zap_debounce=float(self.zap_debounce),
         )
 
-    def _rewire_epg(self):
-        """Point the engine's aggregator at the vendored copy + full ID set."""
-        aggregator = self.engine.epg_aggregator
-        if aggregator is None:
-            return
-        aggregator.wanted_ids = set(self._epg_wanted)
+    def _build_epg(self):
+        """Construct the XMLTV aggregator over the engine's own channel table."""
+        engine = self.engine
+        try:
+            module = _load_module(_EPG_MODULE_NAME, EPG_PATH)
+            wanted = {
+                engine.TVG_IDS.get(slug, slug.upper())
+                for slug in engine.global_channel_dir.canonical_slugs
+            }
+            self.epg = module.EpgAggregator(wanted)
+        except Exception as error:
+            self.epg = None
+            self.log("[ysp] EPG 聚合器初始化失败: %s (EPG 将不可用)" % error)
 
     def _init_device(self):
         """Register the device identity; keeps retrying with backoff."""
@@ -201,23 +208,17 @@ class YspRuntime:
                 attempt += 1
                 self._last_error = "%s: %s" % (type(error).__name__, str(error)[:160])
                 engine.set_resolver_ready(False)
-                if "HTTP 400" in str(error) and self.resolver is not None:
-                    try:
-                        self.resolver.rotate_device_on_400("init:" + str(error)[:60])
-                    except Exception:
-                        pass
                 if attempt == 1:
                     self.log("[ysp] 设备注册失败 (%s), 高码率暂走 1080p 回退"
                              % self._last_error)
                 time.sleep(min(15.0 * (1.5 ** min(attempt - 1, 4)), 60.0))
 
     def _warm_epg(self):
-        aggregator = self.engine.epg_aggregator
-        if aggregator is None:
+        if self.epg is None:
             return
         try:
             started = time.time()
-            ok = aggregator.refresh_now()
+            ok = self.epg.refresh_now()
             self.log("[ysp] EPG 预热 %s (%.0fs)"
                      % ("完成" if ok else "失败", time.time() - started))
         except Exception as error:
@@ -238,10 +239,13 @@ class YspRuntime:
         env = dict(os.environ)
         env["PORT"] = str(self.engine_port)
         env["HOST"] = "127.0.0.1"
-        env.setdefault("YSP_ENGINE_PORT", str(self.engine_port))
+        env["YSP_ENGINE_PORT"] = str(self.engine_port)
+        env["YSP_GATEWAY_PORT"] = str(self.port)
+        env["YSP_CATCHUP_CHANNELS"] = ",".join(
+            sorted(self.engine.TIMESHIFT_SUPPORTED))
         try:
             self._engine_proc = subprocess.Popen(
-                [node, ENGINE_JS],
+                [node, ENGINE_JS, str(self.engine_port)],
                 env=env,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -287,8 +291,9 @@ class YspRuntime:
 
     def catalog(self):
         """Return ``[{name, channel}]`` groups for the M3U builder."""
+        engine = self.engine
         groups = {}
-        for meta in self.engine.global_channel_dir.unique_channels():
+        for meta in engine.global_channel_dir.unique_channels():
             group = groups.setdefault(meta["group"], [])
             slug = meta["slug"]
             group.append({
@@ -297,7 +302,7 @@ class YspRuntime:
                 "tvgId": meta["tvg_id"],
                 "logo": meta.get("logo", ""),
                 "slug": slug,
-                "catchup": slug in self.engine.TIMESHIFT_SUPPORTED,
+                "catchup": slug in engine.TIMESHIFT_SUPPORTED,
             })
         return [{"name": name, "channel": channels}
                 for name, channels in groups.items()]
@@ -310,9 +315,10 @@ class YspRuntime:
     # -------------------------------------------------------------- playlist
 
     def playlist(self, slug, host_header, proto="http", catchup=None):
-        """Four-layer fallback: device protocol -> 1080p -> Node WASM engine.
+        """Fallback chain: device protocol -> 1080p -> Node WASM engine.
 
-        ``catchup`` is an optional ``(start_ts, end_ts)`` pair for timeshift.
+        ``catchup`` is an optional ``(start_ts, end_ts)`` pair; it is served
+        from the JCE timeshift endpoint, matching upstream ``serve_catchup``.
         Raises :class:`YspEngineError` when every layer fails.
         """
         engine = self.engine
@@ -320,67 +326,85 @@ class YspRuntime:
         channel = engine.get_channel_instance(canonical)
         if channel is None:
             raise YspEngineError("未知频道: %s" % slug)
-
-        # Layer 0 -- 7-day catchup (JCE timeshift).
         if catchup:
-            start_ts, end_ts = catchup
-            try:
-                url = engine.jce_timeshift_url(
-                    channel.pid, channel.sid, start_ts, end_ts, channel.defn)
-                return engine.fetch_abs_playlist(url)
-            except Exception as error:
-                self.log("[ysp] %s 时移获取失败: %s, 回退直播"
-                         % (canonical, str(error)[:80]))
+            return self._catchup_playlist(channel, catchup)
+        return self._live_playlist(channel, canonical, host_header, proto)
+
+    def _catchup_playlist(self, channel, catchup):
+        engine = self.engine
+        start, requested_end = catchup
+        end = min(int(requested_end), int(time.time()))
+        if not 0 < int(start) < end:
+            raise YspEngineError("回看时间无效，请检查起止时间")
+        key = (int(start), int(requested_end), end == int(requested_end))
+        with channel.replay_lock:
+            cached = channel.replay_cache
+            if cached and cached[0] == key and cached[1] > time.monotonic():
+                return cached[2]
+            url = engine.jce_timeshift_url(
+                channel.pid, channel.sid, int(start), end, channel.defn)
+            playlist = engine.fetch_abs_playlist(url)
+            if not playlist.lstrip().startswith("#EXTM3U") or "#EXTINF:" not in playlist:
+                raise YspEngineError("回看时段没有媒体分片")
+            playlist = engine.relay_replay_playlist(channel.slug, playlist)
+            channel.replay_cache = (
+                key, time.monotonic() + (30 if key[2] else 5), playlist)
+            return playlist
+
+    def _live_playlist(self, channel, canonical, host_header, proto):
+        engine = self.engine
+        host = host_header or "localhost:%d" % self.port
+        if proto not in ("http", "https"):
+            proto = "http"
+
+        if time.monotonic() < channel.rights_blocked_until:
+            raise YspEngineError(channel.last_error or "此频道暂不提供直播")
 
         # Layer 1 -- device protocol (real 4K/8K, signed playback headers).
-        if (canonical in engine.active_backend_channels and engine.resolver_ready()
-                and self.resolver is not None
+        if (canonical in engine.active_backend_channels
+                and engine.resolver_ready() and self.resolver is not None
+                and time.monotonic() >= channel.prefer_regular_until
                 and not self.resolver.is_channel_in_cooldown(canonical)):
             try:
                 body = self.resolver.fetch_channel_playlist(
-                    canonical, host_header, proto)
+                    canonical, host, proto, defer=True)
                 if body and "#EXTM3U" in body:
-                    return body
+                    return channel.timeline.publish("device", body)
             except Exception as error:
-                self._note_channel_failure(canonical, error)
                 self.log("[ysp] %s 高码率受限 (%s), 平滑回退 1080p"
                          % (canonical, str(error)[:100]))
 
-        # Layer 2 -- 1080p JCE / bkliveinfo.
+        # Layer 2 -- 1080p (bkliveinfo / JCE) with a short write-through cache.
         now = time.time()
         with channel.lock:
             cached = channel.last_built_playlist
-            cached_age = now - channel.last_built_time
+            cached_source = channel.last_built_source
+            cached_age = now - min(channel.last_built_time, channel.last_ok)
         if cached and cached_age < 15.0 and "#EXTM3U" in cached:
-            return cached
+            return channel.timeline.publish(cached_source, cached)
+
+        channel.last_access = now
         engine.ensure_channel(channel)
-        body = engine.build_playlist(channel, holdback=True)
-        if body and "#EXTM3U" in body:
-            return body
+        with channel.lock:
+            built = (channel.last_built_playlist
+                     if time.time() - channel.last_ok < 30 else None)
+            built_source = channel.last_built_source
+        if not built:
+            built = engine.build_playlist(channel)
+        if built and "#EXTM3U" in built:
+            return channel.timeline.publish(built_source, built)
 
         # Layer 3 -- Node WASM companion engine.
-        body = engine.fetch_upstream_engine_playlist(
-            canonical, host_header, proto)
+        body = engine.fetch_upstream_engine_playlist(canonical, host, proto)
         if body and "#EXTM3U" in body:
-            return body
+            return channel.timeline.publish("engine", body)
 
         raise YspEngineError("频道 %s 暂无数据 (%s)"
                              % (channel.name, channel.last_error or "拉取中"))
 
-    def _note_channel_failure(self, channel, error):
-        if self.resolver is None:
-            return
-        with self.resolver.state_lock:
-            previous = self.resolver.state.channel_failures.get(channel)
-            count = (previous[2] + 1) if previous else 1
-            self.resolver.state.channel_failures[channel] = (
-                time.time(), str(error), count)
-        cooldown = 15 if count <= 1 else (60 if count == 2 else 120)
-        self.log("[ysp] %s 进入冷却 %ds" % (channel, cooldown))
-
     # ------------------------------------------------------------- TS relay
 
-    def decode_ts_token(self, path_or_query):
+    def ts_relay_token(self, path_or_query):
         """Turn a ``/proxy.ts?=token`` (or ``/proxy?ts=token``) into a real URL."""
         token = self.engine.proxy_ts_token(path_or_query)
         if not token:
@@ -389,6 +413,9 @@ class YspRuntime:
         if not _ts_host_allowed(real_url):
             raise YspEngineError("forbidden ts host")
         return real_url
+
+    # Backwards-compatible alias for older gateway code.
+    decode_ts_token = ts_relay_token
 
     def playback_headers(self, real_url):
         if self.resolver is None:
@@ -401,6 +428,76 @@ class YspRuntime:
     def ts_cache(self):
         return getattr(self.engine, "global_ts_cache", None)
 
+    def live_segment(self, path_with_query):
+        """Relay one 1080p live segment (``/live-segment.ts?url=&id=``).
+
+        Returns ``(data, media_type)``.  The HMAC token proves the URL was
+        minted by this process, so arbitrary URLs cannot be relayed.
+        """
+        engine = self.engine
+        params = urllib.parse.parse_qs(
+            urllib.parse.urlsplit(path_with_query).query)
+        target = params.get("url", [""])[0]
+        token = params.get("id", [""])[0]
+        if not target or not _hmac_compare(token, engine.segment_relay_id(target)):
+            raise YspEngineError("unknown segment")
+        if not _ts_host_allowed(target):
+            raise YspEngineError("forbidden ts host")
+        try:
+            data, media_type = engine.fetch_live_segment(target)
+        except Exception as error:
+            raise YspEngineError("%s: %s" % (type(error).__name__, error))
+        return data, media_type
+
+    def replay_segment_request(self, path_with_query, range_header=None):
+        """Prepare one catchup segment relay (``/replay-segment.ts``).
+
+        Returns ``(status, headers, response)``; the caller streams
+        ``response`` and closes it.
+        """
+        engine = self.engine
+        params = urllib.parse.parse_qs(
+            urllib.parse.urlsplit(path_with_query).query)
+        target = params.get("url", [""])[0]
+        slug = params.get("channel", [""])[0]
+        token = params.get("id", [""])[0]
+        if slug not in engine.CHANNEL_MAP or not _hmac_compare(
+                token, engine.replay_segment_id(slug, target)):
+            raise YspEngineError("unknown segment")
+        extra = {"Range": range_header} if range_header else {}
+        current = target
+        for _ in range(4):
+            parts = urllib.parse.urlsplit(current)
+            host = (parts.hostname or "").lower()
+            if (parts.scheme not in ("https", "http")
+                    or not engine.is_engine_media_host(host)
+                    or parts.username or parts.port not in (None, 80, 443)):
+                raise YspEngineError("回看分片目标不受支持")
+            response = engine.open_media(
+                current, engine._playback_request_headers({}, extra), timeout=20)
+            if response.status in (301, 302, 303, 307, 308):
+                location = response.headers.get("Location")
+                response.close()
+                if not location:
+                    raise YspEngineError("回看分片重定向缺少目标")
+                current = urllib.parse.urljoin(current, location)
+                continue
+            if response.status not in (200, 206):
+                status = response.status if 400 <= response.status <= 599 else 502
+                response.close()
+                raise YspEngineError("下载回看分片: HTTP %d" % status)
+            if response.headers.get_content_type() == "text/html":
+                response.close()
+                raise YspEngineError("回看分片返回了 HTML")
+            headers = {
+                field: response.headers[field]
+                for field in ("Content-Type", "Content-Length",
+                              "Content-Range", "Accept-Ranges")
+                if field in response.headers
+            }
+            return response.status, headers, response
+        raise YspEngineError("回看分片重定向过多")
+
     # ------------------------------------------------------------------ EPG
 
     def epg_xml(self, wait_seconds=8.0):
@@ -409,34 +506,30 @@ class YspRuntime:
         A cold pull of both upstream feeds takes ~2.5 minutes, so the first
         request must not block on it: we wait briefly for the background warm
         thread, then fall back to a well-formed (empty) XMLTV rather than
-        holding the connection. Players treat that as "no guide yet" and keep
-        playing.
+        holding the connection.  Players treat that as "no guide yet" and
+        keep playing.
         """
-        aggregator = self.engine.epg_aggregator
-        if aggregator is None:
+        if self.epg is None:
             raise YspEngineError("EPG aggregator not available")
-        xml = aggregator.get_xml()
+        xml = self.epg.get_xml()
         if xml is None:
             deadline = time.time() + max(0.0, wait_seconds)
             while time.time() < deadline:
                 time.sleep(0.5)
-                xml = aggregator.get_xml()
+                xml = self.epg.get_xml()
                 if xml is not None:
                     break
-        if xml is None:
-            return _EMPTY_EPG
-        return xml
+        return xml if xml is not None else _EMPTY_EPG
 
     def epg_status(self):
-        aggregator = self.engine.epg_aggregator
-        if aggregator is None:
+        if self.epg is None:
             return {"available": False}
-        last = aggregator.last_refresh_time()
+        last = self.epg.last_refresh_time()
         return {
             "available": True,
-            "channels": len(aggregator.wanted_ids),
+            "channels": len(self.epg.wanted_ids),
             "age_seconds": int(time.time() - last) if last else None,
-            "last_error": aggregator.last_error(),
+            "last_error": self.epg.last_error(),
         }
 
     # -------------------------------------------------------------- status
@@ -447,12 +540,20 @@ class YspRuntime:
     def health(self):
         engine = self.engine
         resolver = self.resolver
+        sessions = dict(getattr(resolver.state, "sessions", {})) if resolver else {}
         session = resolver.state.app_session if resolver is not None else None
+        slot0 = sessions.get(0)
+        active_slots = 0
+        if resolver is not None:
+            active_slots = len([s for s in sessions.values()
+                                if s and resolver.app_session_fresh(s)])
         return {
+            "version": engine.__version__,
             "device_ready": self._ready,
             "device_error": self._last_error,
             "device_ready_age": int(time.time() - self._device_ready_at)
                                if self._device_ready_at else None,
+            "active_device_slots": active_slots,
             "session": {
                 "valid": bool(session and resolver.app_session_fresh(session)),
                 "guid": session.cloud_guid if session else "",
@@ -460,7 +561,11 @@ class YspRuntime:
                 "heartbeat_count": session.heartbeat_count if session else 0,
                 "last_heartbeat": session.last_heartbeat_result if session else "",
             },
+            "linked_channels": len(slot0.linked_channels) if slot0 else 0,
+            "links_per_device": int(getattr(resolver.args, "links_per_device", 0))
+                                if resolver else 0,
             "high_bitrate_channels": sorted(engine.active_backend_channels),
+            "channels": len(engine.global_channel_dir.unique_channels()),
             "engine_js": _port_listening(self.engine_port),
             "engine_js_port": self.engine_port,
             "identity_resets": resolver.state.identity_reset_count
@@ -470,15 +575,18 @@ class YspRuntime:
 
     def diag_lines(self):
         engine = self.engine
+        resolver = self.resolver
         info = [
             "====================================================",
-            "ysp-live v9.5 引擎 (vendor: waastudios/ysptp-docker)",
+            "ysp-live v%s 引擎 (vendor: 上游 ysp-live)" % engine.__version__,
         ]
-        device = self.engine.device_state_summary() \
-            if hasattr(engine, "device_state_summary") else None
-        if device is None and self.resolver is not None:
-            device = self.resolver.status_json().get("device_state")
-        if device:
+        device = None
+        if resolver is not None:
+            try:
+                device = resolver.status_json().get("device_state")
+            except Exception:
+                device = None
+        if device and device.get("exists"):
             info.append("设备: %s %s (%s)" % (
                 device.get("brand", "?"), device.get("model", "?"),
                 "已注册" if device.get("cloud_guid_present") else "未注册"))
@@ -488,6 +596,11 @@ class YspRuntime:
             " (%s)" % self._last_error if self._last_error else ""))
         info.append("WASM 兜底引擎: %s"
                     % ("就绪" if _port_listening(self.engine_port) else "未启用"))
+        cache = engine.global_ts_cache
+        if cache is not None:
+            stats = cache.stats()
+            info.append("分片内存缓存: 条目=%s, 占用=%sMB, 命中率=%s"
+                        % (stats["count"], stats["size_mb"], stats["hit_rate"]))
         epg = self.epg_status()
         if epg.get("available"):
             age = epg["age_seconds"]
@@ -499,6 +612,13 @@ class YspRuntime:
         else:
             info.append("EPG: 未启用")
         return "\n".join(info) + "\n"
+
+
+def _hmac_compare(given, expected):
+    try:
+        return hmac.compare_digest(str(given), str(expected))
+    except Exception:
+        return False
 
 
 def _ts_host_allowed(real_url):

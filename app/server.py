@@ -2,9 +2,10 @@
 
 Serves the bundled providers as one M3U catalogue:
 
-* ``ysp`` (央视频 ysp-live v9.5, the CCTV device protocol) serves ``/ysp/<slug>.m3u8``.
-  Real 4K/8K streams are signed, so TS segments must be relayed by us through
-  ``/proxy.ts``; 1080p/7-day-catchup playlists can point straight at the CDN.
+* ``ysp`` (央视频 ysp-live v11.3, the CCTV device protocol) serves
+  ``/ysp/<slug>.m3u8``.  Upstream segments always need the signed playback
+  headers, so all three relay routes are kept: ``/proxy.ts`` (device protocol),
+  ``/live-segment.ts`` (1080p) and ``/replay-segment.ts`` (7-day catchup).
 * ``aptv`` (legacy JCE + bkliveinfo spider) serves a direct-CDN HLS playlist at
   ``/aptv/<slug>.m3u8`` -- the player pulls segments straight from CCTV's CDN.
 * ``gdtv`` (广东广电) resolves the live manifest through ``/proxy?sp=gdtv``.
@@ -279,6 +280,12 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/proxy.ts"):
             self._ts_relay(self.path)
             return
+        if path.startswith("/live-segment.ts"):
+            self._live_segment(path, parsed.query)
+            return
+        if path.startswith("/replay-segment.ts"):
+            self._replay_segment(self.path)
+            return
         if path.startswith("/ysp/"):
             self._ysp(path, urllib.parse.parse_qs(parsed.query))
             return
@@ -416,22 +423,103 @@ class Handler(BaseHTTPRequestHandler):
                        {"X-Cache": "HIT-RAM"})
             return
         playback = provider.playback_headers(real_url)
+        request = urllib.request.Request(real_url, headers=playback)
+        if range_header:
+            request.add_header("Range", range_header)
         try:
-            request = urllib.request.Request(real_url, headers=playback)
-            if range_header:
-                request.add_header("Range", range_header)
-            with urllib.request.urlopen(request, timeout=30) as response:
-                data = response.read()
-                ctype = response.headers.get("Content-Type", "video/mp2t")
+            response = urllib.request.urlopen(request, timeout=30)
         except Exception as error:
             self._send(502, "upstream segment error: %s\n" % error)
             return
-        if cache is not None and not range_header and len(data) <= 35 * 1024 * 1024:
+        # Stream instead of buffering so players see the first bytes fast, and
+        # pass Range/206 through so seeking inside a segment still works.
+        with response:
+            status = response.status
+            passthrough = {}
+            for field in ("Content-Type", "Content-Length", "Content-Range",
+                          "Accept-Ranges", "ETag", "Last-Modified"):
+                value = response.headers.get(field)
+                if value:
+                    passthrough[field] = value
+            passthrough["X-Cache"] = "MISS-UPSTREAM"
+            self.send_response(status)
+            for key, value in passthrough.items():
+                self.send_header(key, value)
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            if self.command == "HEAD":
+                return
+            bufferable = not range_header and status == 200
+            body = bytearray()
             try:
-                cache.set(real_url, data, {"Content-Type": ctype})
-            except Exception:
-                pass
-        self._send(200, data, ctype, {"X-Cache": "MISS-UPSTREAM"})
+                while True:
+                    chunk = response.read(65536)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    if bufferable:
+                        if len(body) + len(chunk) <= 35 * 1024 * 1024:
+                            body.extend(chunk)
+                        else:
+                            bufferable = False
+                            body = bytearray()
+            except (BrokenPipeError, ConnectionResetError):
+                self.close_connection = True
+                bufferable = False
+            if bufferable and body and cache is not None:
+                try:
+                    cache.set(real_url, bytes(body), {
+                        "Content-Type": passthrough.get("Content-Type", "video/mp2t")})
+                except Exception:
+                    pass
+
+    def _live_segment(self, path, query):
+        """Relay one 1080p live segment (``/live-segment.ts?url=&id=``)."""
+        provider = providers.PROVIDER_MAP.get("ysp")
+        if provider is None:
+            self._send(404, "ysp source not configured\n")
+            return
+        try:
+            data, media_type = provider.live_segment("%s?%s" % (path, query))
+        except Exception as error:
+            text = str(error)
+            code = 403 if ("unknown segment" in text or "forbidden" in text) else 502
+            self._send(code, "%s\n" % text)
+            return
+        self._send(200, data, media_type)
+
+    def _replay_segment(self, request_path):
+        """Relay one 7-day catchup segment (``/replay-segment.ts?url=&id=``)."""
+        provider = providers.PROVIDER_MAP.get("ysp")
+        if provider is None:
+            self._send(404, "ysp source not configured\n")
+            return
+        try:
+            status, headers, response = provider.replay_segment_request(
+                request_path, self.headers.get("Range"))
+        except Exception as error:
+            text = str(error)
+            code = 403 if ("unknown segment" in text or "不受支持" in text) else 502
+            self._send(code, "%s\n" % text)
+            return
+        with response:
+            self.send_response(status)
+            for key, value in headers.items():
+                self.send_header(key, value)
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            if self.command == "HEAD":
+                return
+            try:
+                while True:
+                    chunk = response.read(65536)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+            except (BrokenPipeError, ConnectionResetError):
+                self.close_connection = True
 
 
 def _parse_catchup(query):

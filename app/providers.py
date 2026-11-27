@@ -6,11 +6,12 @@ Three shapes are supported:
               (used by 广东广电).  Channels point at ``/proxy?...``.
 * ``aptv``  - the legacy JCE + bkliveinfo spider (kept as a pure-stdlib
               fallback; channels point at ``/aptv/<slug>.m3u8``).
-* ``ysp``   - the vendored ysp-live v9.5 engine (央视频设备协议).  It provides
+* ``ysp``   - the vendored ysp-live v11.3 engine (央视频设备协议).  It provides
               real 4K/8K, 7-day catchup and the aggregated EPG; channels point
               at ``/ysp/<slug>.m3u8`` and TS segments are relayed through
-              ``/proxy.ts`` because the device protocol needs signed playback
-              headers.
+              ``/proxy.ts`` (device protocol), ``/live-segment.ts`` (1080p) and
+              ``/replay-segment.ts`` (catchup), because the upstream CDN needs
+              signed playback headers.
 """
 
 import importlib
@@ -36,7 +37,7 @@ SOURCES = [
         "no_device": os.environ.get("YSP_NO_DEVICE", "").lower() in ("1", "true", "yes"),
         "only_4k": os.environ.get("YSP_ONLY_4K", "").lower() in ("1", "true", "yes"),
         "links_per_device": int(os.environ.get("YSP_LINKS_PER_DEVICE", "6") or 0),
-        "zap_debounce": float(os.environ.get("YSP_ZAP_DEBOUNCE", "10") or 0),
+        "zap_debounce": float(os.environ.get("YSP_ZAP_DEBOUNCE", "0") or 0),
         "cache_mb": int(os.environ.get("YSP_CACHE_MB", "200") or 0),
         "no_engine": os.environ.get("YSP_NO_ENGINE", "").lower() in ("1", "true", "yes"),
     },
@@ -241,7 +242,7 @@ class AptvProvider(Provider):
 
 
 class YspProvider(Provider):
-    """Adapter for the vendored ysp-live v9.5 engine (央视频设备协议).
+    """Adapter for the vendored ysp-live v11.3 engine (央视频设备协议).
 
     Unlike the other providers this one boots a long-lived runtime: a
     registered CCTV device identity, a heartbeat keeper and the optional
@@ -270,7 +271,7 @@ class YspProvider(Provider):
                     no_device=bool(self.config.get("no_device")),
                     only_4k=bool(self.config.get("only_4k")),
                     links_per_device=self.config.get("links_per_device", 6),
-                    zap_debounce=self.config.get("zap_debounce", 10.0),
+                    zap_debounce=self.config.get("zap_debounce", 0.0),
                     cache_mb=self.config.get("cache_mb", 200),
                     start_engine=not self.config.get("no_engine"),
                     log=lambda msg: log("%s" % msg),
@@ -290,7 +291,7 @@ class YspProvider(Provider):
         self.port = int(os.environ.get("PORT", "8577") or 8577)
 
     def title(self):
-        return "央视频 (设备协议 v9.5)"
+        return "央视频 (设备协议 v11.3)"
 
     def build_catalog(self, runtime):
         groups = runtime.catalog()
@@ -331,6 +332,20 @@ class YspProvider(Provider):
         if runtime is None:
             raise RuntimeError(self.error or "provider unavailable")
         return runtime.decode_ts_token(path_with_query)
+
+    def live_segment(self, path_with_query):
+        """Relay one 1080p live segment (``/live-segment.ts``)."""
+        runtime = self.ensure()
+        if runtime is None:
+            raise RuntimeError(self.error or "provider unavailable")
+        return runtime.live_segment(path_with_query)
+
+    def replay_segment_request(self, path_with_query, range_header=None):
+        """Prepare one catchup segment relay (``/replay-segment.ts``)."""
+        runtime = self.ensure()
+        if runtime is None:
+            raise RuntimeError(self.error or "provider unavailable")
+        return runtime.replay_segment_request(path_with_query, range_header)
 
     def playback_headers(self, real_url):
         runtime = self.ensure()

@@ -12,3 +12,4 @@ server.log
 server.err
 *.log
 data/
+.bak/
